@@ -1,6 +1,9 @@
 import torch
 from data_trf import load_imdb, load_imdb_synth, load_xor, load_toy, load_wp
 import torch.nn as nn
+import math
+import torch.nn.functional as F
+import time
 
 
 # Q1
@@ -439,7 +442,7 @@ def make_random_batch(data, b, L):
     return batch
 
 # Q11
-
+'''
 class CausalSelfAttention(nn.Module):
     def forward(self, x):
         # x: (batch, time, emb)
@@ -468,6 +471,144 @@ class AutoregressiveModel(nn.Module):
         attn_out = self.self_attention(emb)  # (batch, time, emb)
         logits = self.fc(attn_out)  # (batch, time, vocab_size)
         return logits
+'''
+
+# Q11 updated
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, emb_dim, num_heads=6, dropout=0.1):
+        super().__init__()
+        assert emb_dim % num_heads == 0, "emb_dim must divide num_heads"
+
+        self.num_heads = num_heads
+        self.head_dim = emb_dim // num_heads
+
+        # Linear layers for Q, K, V
+        self.Wq = nn.Linear(emb_dim, emb_dim)
+        self.Wk = nn.Linear(emb_dim, emb_dim)
+        self.Wv = nn.Linear(emb_dim, emb_dim)
+
+        # Output projection
+        self.Wo = nn.Linear(emb_dim, emb_dim)
+
+        # Dropout on attention weights
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, E = x.shape
+
+        # Project to Q, K, V
+        q = self.Wq(x)  # (B, T, E)
+        k = self.Wk(x)
+        v = self.Wv(x)
+
+        # Reshape into (B, heads, T, head_dim)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Causal mask
+        mask = torch.triu(
+            torch.ones(T, T, device=x.device) * float('-inf'),
+            diagonal=1
+        )
+        scores = scores + mask  # broadcast to (B, heads, T, T)
+
+        # Attention weights
+        att = F.softmax(scores, dim=-1)
+        att = self.dropout(att)
+
+        # Weighted sum
+        out = torch.matmul(att, v)  # (B, heads, T, head_dim)
+
+        # Combine heads back
+        out = out.transpose(1, 2).contiguous().view(B, T, E)
+
+        return self.Wo(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, emb_dim, num_heads=6, dropout=0.1):
+        super().__init__()
+
+        self.ln1 = nn.LayerNorm(emb_dim)
+        self.att = CausalSelfAttention(emb_dim, num_heads, dropout)
+
+        self.ln2 = nn.LayerNorm(emb_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(emb_dim, 4 * emb_dim),
+            nn.ReLU(),
+            nn.Linear(4 * emb_dim, emb_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        # Attention + residual
+        x = x + self.att(self.ln1(x))
+
+        # Feedforward + residual
+        x = x + self.ff(self.ln2(x))
+
+        return x
+
+class AutoregressiveModel(nn.Module):
+    def __init__(self, vocab_size, emb_dim=300,
+                 num_heads=6, num_layers=6, dropout=0.1):
+        super().__init__()
+
+        self.embedding = nn.Embedding(vocab_size, emb_dim)
+
+        # 6 transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(emb_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(emb_dim)
+        self.fc = nn.Linear(emb_dim, vocab_size)
+
+    def forward(self, x):
+        x = self.embedding(x)  # (B, T, emb)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_f(x)
+        logits = self.fc(x)
+        return logits
+
+
+# Q12
+
+NAT_TO_BIT = 1.4426950408889634   # = log2(e)
+
+def evaluate_autoregressive(model, val_data, batch_size, L, vocab_size, iters=50):
+    """
+    Compute average log-probability (cross-entropy) on validation set.
+    Returns the loss in NATS — caller converts to bits.
+    """
+    model.eval()
+    total_loss = 0
+
+    with torch.no_grad():
+        for _ in range(iters):
+            batch = make_random_batch(val_data, batch_size, L+1)
+            x = batch[:, :-1]       # inputs (t0 ... t_{L-1})
+            y = batch[:, 1:]        # targets (t1 ... t_L)
+
+            logits = model(x)
+            loss = F.cross_entropy(
+                logits.reshape(-1, vocab_size),
+                y.reshape(-1)
+            )
+            total_loss += loss.item()
+
+    return total_loss / iters
+
+
 
 
 # Run Q3 experiment
@@ -726,7 +867,7 @@ if __name__ == "__main__":
     #   7 -> Q7 full multi-head self-attention + select pool
     #   8 -> Q8 XOR with/without positional embeddings
     # ==========================================================
-    RUN_QUESTION = 5   # change this number to choose question to run
+    RUN_QUESTION = 12   # change this number to choose question to run
 
     # ------------ Q3: Baseline classifier with 3 pooling types ------------
     if RUN_QUESTION == 3:
@@ -1078,6 +1219,77 @@ if __name__ == "__main__":
         test_input = torch.randint(0, vocab_size, (1, L))
         logits = model(test_input)
         print("\nTest output shape:", logits.shape)
+
+    if RUN_QUESTION == 12:
+        print("\n================ RUNNING EXPERIMENTS (Q12) ================\n")
+
+        
+        start_time = time.time()
+
+        # Load dataset (toy language modeling task)
+        (train, val), (i2c, c2i) = load_toy(final=False)
+        vocab_size = len(i2c)
+
+        train_data = torch.tensor(train, dtype=torch.long).contiguous()
+        val_data   = torch.tensor(val, dtype=torch.long).contiguous()
+
+        # Hyperparameters
+        batch_size = 32
+        L = 256
+        emb_dim = 300
+        num_epochs = 5
+        lr = 1e-3
+
+        # Model + optimizer
+        model = AutoregressiveModel(vocab_size, emb_dim)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        # Initial validation log-probability
+        init_loss_nats = evaluate_autoregressive(model, val_data, batch_size, L, vocab_size)
+        init_loss_bits = init_loss_nats * NAT_TO_BIT
+        print(f"Initial validation loss: {init_loss_bits:.4f} bits")
+
+        # ------------------ Training Loop (with time limit) ------------------
+        for epoch in range(num_epochs):
+
+            model.train()
+            total_loss = 0.0
+            epoch_start = time.time()
+
+            for _ in range(1000):
+
+                batch = make_random_batch(train_data, batch_size, L+1)
+                x = batch[:, :-1]
+                y = batch[:, 1:]
+
+                optimizer.zero_grad()
+                logits = model(x)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, vocab_size),
+                    y.reshape(-1)
+                )
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+
+            # Convert training loss to bits
+            train_bits = (total_loss / 1000) * NAT_TO_BIT
+
+            # Validation (fast, only ~50 batches)
+            val_loss_nats = evaluate_autoregressive(
+                model, val_data, batch_size, L, vocab_size, iters=50
+            )
+            val_bits = val_loss_nats * NAT_TO_BIT
+
+            print(f"Epoch {epoch+1}/{num_epochs} | "
+                f"train_bits={train_bits:.4f} | "
+                f"val_bits={val_bits:.4f} | "
+                f"epoch_time={time.time() - epoch_start:.1f}s")
+
+        # --------------------------------------------------------------------
+        total_minutes = (time.time() - start_time) / 60
+        print(f"\n✓ Finished Q12 in {total_minutes:.2f} minutes.")
 
 
     else:
